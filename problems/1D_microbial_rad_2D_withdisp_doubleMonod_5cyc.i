@@ -1,0 +1,757 @@
+inject_fluid_mass = 3614484 # kg
+inject_fluid_mass_h = '${fparse inject_fluid_mass*0.13/1.002}' # kg
+inject_fluid_mass_c = '${fparse inject_fluid_mass*0.87/1.002}' # kg
+
+produce_fluid_mass = '${fparse inject_fluid_mass_h + inject_fluid_mass_c}'
+
+inject_time = 1.577e7 # # 6 months in seconds
+
+store_time =  0 # seconds
+produce_time = 1.577e7 #1.577e7 # # 6 months in seconds
+rest_time = 0 # days
+num_cycles = 5 # Currently needs to be <= 10
+
+cycle_length = '${fparse inject_time + store_time + produce_time + rest_time}'
+
+end_simulation = '${fparse cycle_length * num_cycles}'
+
+start_injection1 = 0
+start_injection2 = ${cycle_length}
+start_injection3 = '${fparse cycle_length * 2}'
+start_injection4 = '${fparse cycle_length * 3}'
+start_injection5 = '${fparse cycle_length * 4}'
+
+end_injection1 = '${fparse start_injection1 + inject_time}'
+end_injection2 = '${fparse start_injection2 + inject_time}'
+end_injection3 = '${fparse start_injection3 + inject_time}'
+end_injection4 = '${fparse start_injection4 + inject_time}'
+end_injection5 = '${fparse start_injection5 + inject_time}'
+
+
+start_production1 = '${fparse end_injection1 + store_time}'
+start_production2 = '${fparse end_injection2 + store_time}'
+start_production3 = '${fparse end_injection3 + store_time}'
+start_production4 = '${fparse end_injection4 + store_time}'
+start_production5 = '${fparse end_injection5 + store_time}'
+
+end_production1 = '${fparse start_production1 + produce_time}'
+end_production2 = '${fparse start_production2 + produce_time}'
+end_production3 = '${fparse start_production3 + produce_time}'
+end_production4 = '${fparse start_production4 + produce_time}'
+end_production5 = '${fparse start_production5 + produce_time}'
+
+
+synctimes = '${start_injection1} ${end_injection1} ${end_production1} 
+${end_injection2} ${end_production2}
+${end_injection3} ${end_production3}
+${end_injection4} ${end_production4}
+${end_injection5} ${end_production5}'
+
+
+[Mesh]
+    construct_side_list_from_node_list=true
+    coord_type = RZ
+    [gen]
+    type = GeneratedMeshGenerator
+    dim = 2
+    nx = 500
+    #bias_x = 1.05
+    xmin = 0.1
+    xmax = 1000
+    ny = 1
+    ymin = 0
+    ymax = 5
+    # rz_coord_axis = Y
+    # coord_type = RZ
+    []
+
+    [injection_area]
+        type = ParsedGenerateSideset
+        combinatorial_geometry = 'x<0.1001'
+        # included_subdomains = 1
+        new_sideset_name = 'injection_area'
+        input = 'gen'
+    []
+
+[]
+
+
+[GlobalParams]
+    PorousFlowDictator = dictator
+    gravity = '0 0 0'
+[]
+
+[UserObjects]
+    [dictator]
+      type = PorousFlowDictator
+      porous_flow_vars = 'porepressure cgH2 cgCH4 cgCO2'
+      number_fluid_phases = 1
+      number_fluid_components = 4
+    []
+    [pc]
+      type = PorousFlowCapillaryPressureConst
+      pc = 0
+    []
+
+    [fluid_advective_flux]
+        type = PorousFlowAdvectiveFluxCalculatorSaturated
+        flux_limiter_type = superbee
+    []
+
+[]
+  
+[Variables]
+    [porepressure]
+    []
+
+    [cgH2]
+      initial_condition = 0#2170 psi
+      scaling = 1e4
+    []
+    [cgCH4]
+      initial_condition = 0 #
+      scaling = 1e4
+    []
+    [cgCO2]
+      initial_condition = 0 #
+      scaling = 1e4
+    []
+    [npop_d]
+      initial_condition = 1 #
+      scaling = 1e4
+    []
+[]
+
+[ICs]
+
+    [porepressure]
+        type = FunctionIC
+        variable = porepressure
+        function = 10e6-x
+    []
+
+[]
+  
+[AuxVariables]
+    [source_h2]
+        order = FIRST
+        family = LAGRANGE
+    []    
+    [source_ch4]
+        order = FIRST
+        family = LAGRANGE
+    []
+    [source_CO2]
+        order = FIRST
+        family = LAGRANGE
+    []
+    # [source_npop]
+    #     order = FIRST
+    #     family = LAGRANGE
+    # []
+
+    [bounds_dummy]
+        order = FIRST
+        family = LAGRANGE
+    []
+[]
+  
+[Kernels]
+
+    [npop_dt]
+        type = TimeDerivative
+        variable = npop_d
+    []
+
+    [npop_balance]
+        type = MatReaction
+        variable = npop_d
+        reaction_rate = 'npop_source'
+        
+    []
+
+    [mass_gas_dot]
+        type = PorousFlowMassTimeDerivative
+        fluid_component = 3
+        variable = porepressure
+        multiply_by_density = true
+    []
+
+    [flux_gas]
+        type = PorousFlowFullySaturatedDarcyFlow
+        fluid_component = 3
+        variable = porepressure
+        multiply_by_density = true
+    []
+
+    [diff_gas]
+        type = PorousFlowDispersiveFlux
+        fluid_component = 3
+        variable = porepressure
+        disp_trans = 0
+        disp_long = 0
+    []
+
+    [cgH2_dt]
+        type = PorousFlowMassTimeDerivative
+        fluid_component = 0
+        variable = cgH2
+        multiply_by_density = true
+    []
+    [cgH2_diff]
+        type = PorousFlowDispersiveFlux
+        fluid_component = 0
+        variable = cgH2
+        disp_long = 0
+        disp_trans = 0
+    []
+    [cgH2_conv]
+        type =  PorousFlowFullySaturatedDarcyFlow
+        fluid_component = 0
+        variable = cgH2
+        multiply_by_density = true
+    []
+
+    [cgH2_reaction]
+        type = MatReaction
+        variable = cgH2
+        reaction_rate = 'doublemonodterm_h2'
+        
+    []
+
+    [cgCH4_dt]
+        type = PorousFlowMassTimeDerivative
+        fluid_component = 1
+        variable = cgCH4
+        multiply_by_density = true
+    []
+    [cgCH4_diff]
+        type = PorousFlowDispersiveFlux
+        fluid_component = 1
+        variable = cgCH4
+        disp_long = 0
+        disp_trans = 0
+    []
+    [cgCH4_conv]
+        type = PorousFlowFullySaturatedDarcyFlow
+        fluid_component = 1
+        variable = cgCH4
+        multiply_by_density = true
+    []
+
+    [cgCH4_reaction]
+        type = MatCoupledForce
+        variable = cgCH4
+        coef = 1 #
+        v = cgH2
+        material_properties = 'doublemonodterm_ch4'
+        
+    []
+
+    [cgCO2_dt]
+        type = PorousFlowMassTimeDerivative
+        fluid_component = 2
+        variable = cgCO2
+        multiply_by_density = true
+    []
+    [cgCO2_diff]
+        type = PorousFlowDispersiveFlux
+        fluid_component = 2
+        variable = cgCO2
+        disp_long = 0
+        disp_trans = 0
+    []
+    [cgCO2_conv]
+        type = PorousFlowFullySaturatedDarcyFlow
+        fluid_component = 2
+        variable = cgCO2
+        multiply_by_density = true
+    []
+
+    [cgCO2_reaction]
+        type = MatCoupledForce
+        variable = cgCO2
+        coef = -1 #
+        v = cgH2
+        material_properties = 'doublemonodterm_co2'
+        
+    []
+
+[]
+  
+[AuxKernels]
+
+
+    # [source_h2]
+    #     type = ParsedAux
+    #     variable = source_h2
+    #     coupled_variables = 'cgH2 cgCO2'
+    #     expression = '3.18e-9*(cgCO2/(4.4e-5+cgCO2))*(cgH2/(2.02e-8+cgH2))'
+    #     # expression = '3.18e-9*(cgCO2)*(cgH2)'
+    # []
+    # [source_CO2]
+    #     type = ParsedAux
+    #     variable = source_CO2
+    #     coupled_variables = 'cgH2 cgCO2'
+    #     expression = '5.5*3.18e-9*(cgCO2/(4.4e-5+cgCO2))*(cgH2/(2.02e-8+cgH2))'
+    #     # expression = '5.5*3.18e-9*(cgCO2)*(cgH2)'
+    # []
+    # [source_ch4]
+    #     type = ParsedAux
+    #     variable = source_ch4
+    #     coupled_variables = 'cgH2 cgCO2'
+    #     expression = '2*3.18e-9*(cgCO2/(4.4e-5+cgCO2))*(cgH2/(2.02e-8+cgH2))'
+    #     # expression = '2*3.18e-9*(cgCO2)*(cgH2)'
+    # []
+
+[]
+  
+
+[Functions]
+    [injection_rate]
+      type = ParsedFunction
+      symbol_values = injection_area
+      symbol_names = area
+      expression = '-${inject_fluid_mass}/(area *0.162* ${inject_time})' 
+    []
+
+    [inject]
+        type = ParsedFunction
+        expression = 'if(t >= ${start_injection1} & t < ${end_injection1}, 1,
+                      if(t >= ${start_injection2} & t < ${end_injection2}, 1,
+                      if(t >= ${start_injection3} & t < ${end_injection3}, 1,
+                      if(t >= ${start_injection4} & t < ${end_injection4}, 1,
+                      if(t >= ${start_injection5} & t < ${end_injection5}, 1,0)))))'
+    
+    []
+    [produce]
+        type = ParsedFunction
+        expression = 'if(t >= ${start_production1} & t < ${end_production1}, 1,
+                      if(t >= ${start_production2} & t < ${end_production2}, 1,
+                      if(t >= ${start_production3} & t < ${end_production3}, 1,
+                      if(t >= ${start_production4} & t < ${end_production4}, 1,
+                      if(t >= ${start_production5} & t < ${end_production5}, 1,0)))))'
+    
+    []
+
+    [H2_injection_rate]
+      type = ParsedFunction
+      symbol_values = injection_area
+      symbol_names = area
+    #   expression = '-${inject_fluid_mass}*0.13/(area *0.162*1.02 * ${inject_time})' #Retard_h = 1.02
+      expression = '-${inject_fluid_mass_h}/(area *0.162 * ${inject_time})' #Retard_h = 1.02
+    []
+    [CO2_injection_rate]
+      type = ParsedFunction
+      symbol_values = injection_area
+      symbol_names = area
+    #   expression = '-${inject_fluid_mass}*0.87/(area *0.162 *3.05 * ${inject_time})'
+      expression = '-${inject_fluid_mass_c}/(area *0.162 * ${inject_time})'
+    []
+
+    # [CH4_injection_rate]
+    #   type = ParsedFunction
+    #   symbol_values = injection_area
+    #   symbol_names = area
+    #   expression = '-${inject_fluid_mass}*0.0/(area *0.162 * ${inject_time})'
+    # []
+
+    [production_rate]
+      type = ParsedFunction
+      symbol_values = injection_area
+      symbol_names = area
+    #   expression = '${inject_fluid_mass}*0.13/(area *0.162*1.02 * ${inject_time})' #Retard_h = 1.02
+      expression = '${produce_fluid_mass}/(area *0.162 * ${produce_time})' #Retard_h = 1.02
+    []
+
+[]
+
+[Controls]
+
+    [inject_phase]
+        type = ConditionalFunctionEnableControl
+        enable_objects = 'BCs::H2_injection BCs::CO2_injection'
+        #enable_objects = 'BCs::total_injection BCs::cgH2_in BCs::cgCO2_in BCs::cgCH4_in'
+        conditional_function = inject
+        implicit = false
+        execute_on = 'initial timestep_begin'
+    []
+    [produce_phase]
+        type = ConditionalFunctionEnableControl
+        enable_objects = 'BCs::total_production BCs::outflow_h2 BCs::outflow_co2 BCs::outflow_ch4'
+        #enable_objects = 'BCs::outflow_pp BCs::outflow_h2 BCs::outflow_co2 BCs::outflow_ch4'
+        #enable_objects = 'BCs::H2_production BCs::CO2_production BCs::CH4_production'
+        conditional_function = produce
+        implicit = false
+        execute_on = 'initial timestep_begin'
+    []
+
+[]
+
+  
+[FluidProperties]
+    [water]
+        type=SimpleFluidProperties
+        bulk_modulus = 14.5e6
+        density0 = 9.55 # 905.24
+        viscosity = 9.93e-6
+        cv = 14657.2
+        cp = 14657.2
+        porepressure_coefficient = 0.0
+        thermal_expansion = 0
+        thermal_conductivity = 0.22
+    []
+    #[hydrogen]
+    #  type = HydrogenFluidProperties # BrineFluidProperties #   HydrogenFluidProperties # BrineFluidProperties # #HydrogenFluidProperties #BrineFluidProperties
+    #[]
+[]
+  
+[Materials]
+
+
+    [npop_source]
+        type = ParsedMaterial
+        property_name = npop_source
+        constant_names = 'n0 Pgrowth_max Y_h2 Sw Mg Mratio poros gamma halfsat_h2 halfsat_co2 Hc_h Hc_c Ret decay_rate'
+        constant_expressions = '1.8e14 1.95e-4 4.2e11 0.1 0.002 0.022 0.18 1 2e-8 4.4e-5 0.02 1.59 1.002 9e-8'
+        coupled_variables = 'cgH2 cgCO2 npop_d'
+        expression = '(npop_d*Pgrowth_max*Hc_c*Hc_h*cgCO2*cgH2/Y_h2/(halfsat_h2+(cgH2*Hc_h))/(halfsat_co2+(cgCO2*Hc_c))) - (decay_rate*npop_d)'
+        #outputs = exodus
+    []
+
+    [doublemonodsource_h2]
+        type = ParsedMaterial
+        property_name = doublemonodterm_h2
+        constant_names = 'n0 Pgrowth_max Y_h2 Sw Mg Mratio poros gamma halfsat_h2 halfsat_co2 Hc_h Hc_c Ret'
+        constant_expressions = '1.8e14 1.95e-4 4.2e11 0.1 0.002 0.022 0.18 1 2e-8 4.4e-5 0.02 1.59 1.002'
+        coupled_variables = 'cgH2 cgCO2 npop_d'
+        expression = '-gamma*Mratio*poros*Sw*n0*npop_d*Pgrowth_max*Mg*Hc_c*Hc_h*cgCO2/Y_h2/Ret/(halfsat_h2+(cgH2*Hc_h))/(halfsat_co2+(cgCO2*Hc_c))'
+        #outputs = exodus
+    []
+
+    [doublemonodsource_co2]
+        type = ParsedMaterial
+        property_name = doublemonodterm_co2
+        constant_names = 'n0 Pgrowth_max Y_h2 Sw Mg Mratio poros gamma halfsat_h2 halfsat_co2 Hc_h Hc_c Ret'
+        constant_expressions = '1.8e14 1.95e-4 4.2e11 0.1 0.002 0.022 0.18 5.5 2e-8 4.4e-5 0.02 1.59 1.002'
+        coupled_variables = 'cgH2 cgCO2 npop_d'
+        expression = 'gamma*Mratio*poros*Sw*n0*npop_d*Pgrowth_max*Mg*Hc_c*Hc_h*cgCO2/Y_h2/Ret/(halfsat_h2+(cgH2*Hc_h))/(halfsat_co2+(cgCO2*Hc_c))'
+        #outputs = exodus
+    []
+
+    [doublemonodsource_ch4]
+        type = ParsedMaterial
+        property_name = doublemonodterm_ch4
+        constant_names = 'n0 Pgrowth_max Y_h2 Sw Mg Mratio poros gamma halfsat_h2 halfsat_co2 Hc_h Hc_c Ret'
+        constant_expressions = '1.8e14 1.95e-4 4.2e11 0.1 0.002 0.022 0.18 2 2e-8 4.4e-5 0.02 1.59 1.002'
+        coupled_variables = 'cgH2 cgCO2 npop_d'
+        expression = 'gamma*Mratio*poros*Sw*n0*npop_d*Pgrowth_max*Mg*Hc_c*Hc_h*cgCO2/Y_h2/Ret/(halfsat_h2+(cgH2*Hc_h))/(halfsat_co2+(cgCO2*Hc_c))'
+        #outputs = exodus
+    []
+
+    [temperature]
+      type = PorousFlowTemperature
+      temperature = 336.15 #63 C
+      #at_nodes = true
+    []
+    [ppss]
+        type = PorousFlow1PhaseFullySaturated
+        porepressure = porepressure
+    []
+
+    [massfrac]
+        type = PorousFlowMassFraction
+        mass_fraction_vars = 'cgH2 cgCH4 cgCO2'
+    []
+
+    [water]
+      type =  PorousFlowSingleComponentFluid # PorousFlowMultiComponentFluid # PorousFlowSingleComponentFluid #
+      fp = water
+      #fp = H2
+      #x = xH2
+      phase = 0
+      #at_nodes = true
+    []
+
+    [porosity_reservoir]
+      type = PorousFlowPorosityConst
+      porosity = 0.162
+      #at_nodes = true
+    []
+
+    [permeability_reservoir]
+      type = PorousFlowPermeabilityConst
+      #permeability = '1.8e-11 0 0  0 1.8e-11 0  0 0 1.8e-11' #3e-13 = 300 mD
+      permeability = '6.6646e-13 0 0  0 6.6646e-13 0  0 0 0'
+    []
+
+    [relperm]
+     type = PorousFlowRelativePermeabilityConst
+     phase = 0
+     #at_nodes = true
+    []
+
+    [diff]
+        type = PorousFlowDiffusivityConst
+        diffusion_coeff = '8.94e-7 8.94e-7 8.94e-7 8.94e-7'
+        tortuosity = 1
+    []
+
+  []
+  
+[BCs]
+
+    # [cgH2_in]
+    #     type = DirichletBC
+    #     variable = cgH2
+    #     boundary = injection_area
+    #     value = 0.13
+    # []
+
+    # [cgCO2_in]
+    #     type = DirichletBC
+    #     variable = cgCO2
+    #     boundary = injection_area
+    #     value = 0.87
+    # []
+  
+    # [cgCH4_in]
+    #       type = DirichletBC
+    #       variable = cgCH4
+    #       boundary = injection_area
+    #       value = 0
+    # []
+
+
+    # [total_injection]
+    #   type = PorousFlowSink
+    #   boundary = injection_area
+    #   variable = porepressure
+    #   use_mobility = false
+    #   use_relperm = false
+    #   flux_function =  injection_rate
+    #   #value = -0.000125
+    # #   mass_fraction_component = 3
+    # #   fluid_phase=0
+    # []
+
+    [H2_injection]
+      type = PorousFlowSink
+      boundary = injection_area
+      variable = cgH2
+      use_mobility = false
+      use_relperm = false
+      flux_function =  H2_injection_rate
+      #value = -0.000125
+    #   mass_fraction_component = 0
+    #   fluid_phase=0
+    []
+
+    [CO2_injection]
+      type = PorousFlowSink
+      boundary = injection_area
+      variable = cgCO2
+      use_mobility = false
+      use_relperm = false
+      flux_function =  CO2_injection_rate
+      #value = -0.000125
+    #   mass_fraction_component = 2
+    #   fluid_phase=0
+    []
+
+    [total_production]
+      type = PorousFlowSink
+      boundary = injection_area
+      variable = porepressure
+      use_mobility = true
+      use_relperm = true
+      flux_function =  production_rate
+      #value = -0.000125
+      mass_fraction_component = 3
+      fluid_phase=0
+    []
+
+    # [H2_production]
+    #   type = PorousFlowSink
+    #   boundary = left #injection_area
+    #   variable = cgH2
+    #   use_mobility = true
+    #   use_relperm = true
+    #   flux_function =  production_rate
+    #   #value = -0.000125
+    #   mass_fraction_component = 0
+    #   fluid_phase=0
+    # []
+
+    # [CO2_production]
+    #   type = PorousFlowSink
+    #   boundary = left #injection_area
+    #   variable = cgCO2
+    #   use_mobility = true
+    #   use_relperm = true
+    #   flux_function =  production_rate
+    #   #value = -0.000125
+    #   mass_fraction_component = 2
+    #   fluid_phase=0
+    # []
+
+    # [CH4_production]
+    #   type = PorousFlowSink
+    #   boundary = left# injection_area
+    #   variable = cgCH4
+    #   use_mobility = true
+    #   use_relperm = true
+    #   flux_function =  production_rate
+    #   #value = -0.000125
+    #   mass_fraction_component = 1
+    #   fluid_phase=0
+    # []
+
+
+    # [outflow_pp]
+    #     type = PorousFlowOutflowBC
+    #     boundary = left #injection_area
+    #     include_relperm = true # no need for relperm in this fully-saturated simulation
+    #     mass_fraction_component = 3
+    #     variable = porepressure
+        
+    # []
+
+    [outflow_h2]
+        type = PorousFlowOutflowBC
+        boundary = injection_area
+        include_relperm = true # no need for relperm in this fully-saturated simulation
+        mass_fraction_component = 0
+        variable = cgH2
+        
+    []
+
+    [outflow_co2]
+        type = PorousFlowOutflowBC
+        boundary = injection_area
+        include_relperm = true # no need for relperm in this fully-saturated simulation
+        mass_fraction_component = 2
+        variable = cgCO2
+        
+    []
+
+    [outflow_ch4]
+        type = PorousFlowOutflowBC
+        boundary = injection_area
+        include_relperm = true # no need for relperm in this fully-saturated simulation
+        mass_fraction_component = 1
+        variable = cgCH4
+        
+    []
+
+
+[]
+
+[Bounds]
+  [h2_lower]
+    type = ConstantBounds
+    variable = bounds_dummy
+    bounded_variable = cgH2
+    bound_type = lower
+    bound_value = 1e-12
+  []
+
+  [co2_lower]
+    type = ConstantBounds
+    variable = bounds_dummy
+    bounded_variable = cgCO2
+    bound_type = lower
+    bound_value = 1e-12
+  []
+
+  [ch4_lower]
+    type = ConstantBounds
+    variable = bounds_dummy
+    bounded_variable = cgCH4
+    bound_type = lower
+    bound_value = 1e-12
+  []
+[]
+  
+[Postprocessors]
+
+    [injection_area]
+        type = AreaPostprocessor
+        boundary = injection_area
+        execute_on = initial
+    []
+
+    [injection_flux]
+        type = FunctionValuePostprocessor
+        function = injection_rate
+        execute_on = initial
+    []
+    
+
+[]
+  
+[VectorPostprocessors]
+    [ptsuss]
+      type = LineValueSampler
+      use_displaced_mesh = false
+      start_point = '0.1 2.5 0'
+      end_point = '1000 2.5 0'
+      sort_by = x
+      num_points = 500
+      outputs = csv
+      variable = 'cgH2 cgCH4 cgCO2'
+    []
+
+    [point_sample]
+          type = PointValueSampler
+          variable = 'cgH2 cgCH4 cgCO2'
+          points = '0.1 0 0'
+          sort_by = x
+          contains_complete_history = true
+    []
+[]
+  
+[Preconditioning]
+    active = 'mumps'
+    [smp]
+        type = SMP
+        full = true
+        petsc_options_iname = '-snes_type -ksp_type -pc_type -sub_pc_type -sub_pc_factor_shift_type -pc_asm_overlap -snes_atol -snes_rtol -snes_max_it'
+        petsc_options_value = 'vinewtonrsls gmres      asm      lu           NONZERO                   2               1E-5       1E-5        500'
+    []
+    [mumps]
+        type = SMP
+        full = true
+        petsc_options = '-snes_ksp_ew'
+        petsc_options_iname = '-ksp_type -pc_type -pc_factor_mat_solver_package -pc_factor_shift_type -snes_rtol -snes_atol -snes_max_it'
+        petsc_options_value = 'gmres      lu       mumps                         NONZERO               1E-5      1E-5       25'
+    []
+[]
+  
+[Executioner]
+    type = Transient
+    solve_type = NEWTON
+    end_time = ${end_simulation}
+    dtmax = 1e4
+    [TimeStepper]
+      type = IterationAdaptiveDT
+      dt = 100
+      growth_factor = 2
+    []
+    nl_abs_tol = 1e-8
+[]
+
+[Debug]
+    show_var_residual_norms = true
+[]
+  
+[Outputs]
+    print_linear_residuals = false
+    sync_times = ${synctimes} #1 hr, 1 day, 1 month, 5 yrs
+    perf_graph = true
+    exodus = true
+    [csv]
+     type = CSV
+      sync_only = true
+    []
+[]
