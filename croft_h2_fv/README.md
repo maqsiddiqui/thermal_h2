@@ -24,6 +24,7 @@ same schedule and physics:
 | `build_mix_table.py`, `pvt_tools.py` | rebuild that table from the deck (needs CoolProp; reproduces the file exactly) |
 | `postprocess_h2_fv.py` | per-cycle table, time plots and plume maps; prints the mass-balance check |
 | `run_h2_hpc.sh` | Slurm script |
+| `compare_h2_runs.py` | per-cycle and time comparison of two runs (`_cycles.png`, `_time.png`, `_table.csv`) |
 | `moose_addon/` | the four C++ add-ons the input needs (two new, two from the history model) |
 | `checks/` | the 19-layer check runs described below (CSV, figures, tables) |
 | `README.md` | this file |
@@ -63,8 +64,15 @@ same schedule and physics:
   p0 = p0_history − (cumulative influx at the end of history)/capacity. Water leaving the reservoir carries
   the dissolved gas of the cell it leaves; water entering carries native gas.
 * **Same as the history model:** capillary pressure (Brooks–Corey per sub-block, scaled from PCW/SWLPC),
-  rel-perm (Corey fits, per block), rock compressibility, permeability, TPFA flux kernel. Gas–water
-  capillary pressure and rel-perm are assumed the same for the H2 mixture as for the native gas.
+  rel-perm, rock compressibility, permeability, TPFA flux kernel. Gas–water capillary pressure and rel-perm
+  are assumed the same for the H2 mixture as for the native gas.
+* **Rel-perm hysteresis** (when the history input was written by `em2ex2moose.py --fv` with the default
+  `--relperm deck`, from Croft's `SATOPTS HYSTER` / `EHYSTR 1* 3 2* KR`): the deck's tables, gas on Killough
+  scanning curves between the drainage (SATNUM) and imbibition (IMBNUM) tables, water on the imbibition
+  table scaled to IKRW = 0.55, as Eclipse. Each cell's largest gas saturation so far (`sg_max`) comes from
+  the end of the history run and keeps being updated at the end of every step, so gas trapped behind the
+  water advancing during withdrawal stays in place. Histories written with `--relperm corey` keep the
+  Corey fits (no hysteresis). Add-on: `ADPorousFlowRelativePermeabilityHysteresisTable`.
 
 ## Putting it in your thermal_h2 repository
 
@@ -240,6 +248,82 @@ its factors at 7.7 GB (in-core) for the 709,000 unknowns, so on the HPC ask for 
   iteration, composition kept in [0, 1]. Composition is not damped in cells with gas saturation below
   1e-3, where it is poorly determined; damping it there throttled the whole update to a few per cent and
   stalled the run at day 52.
+* **Composition bounds (added after the first full-grid run).** On the full grid the undamped composition
+  in gas-free cells drifted without limit (to −2×10⁸ by day 27). Through the dissolved fraction it then
+  produced fluxes of ~170 kg/s of spurious native gas and H2; because `nl_rel_tol` only asks for a 1000-fold
+  reduction, Newton "converged" each step with ~0.1 kg/s left (more than the injection rate) and the time
+  step collapsed to 10⁻⁴ s. The input now keeps xng inside [−0.05, 1.05] in **every** cell with PETSc's
+  variational-inequality Newton solver (`[Bounds]` with `ConstantBounds`, `-snes_type vinewtonrsls`).
+  The bounds lie 0.05 outside [0, 1]: a bound exactly at 1 (or 0) is active in every pure-native-gas (or
+  pure-H2) cell, removes that cell's composition equation, and leaves the H2 equation without a pivot
+  (MUMPS stops with a zero pivot). The 19-layer run is unchanged by the bounds (identical residuals).
 * `nl_rel_tol = 1e-3`, `nl_abs_tol = 1e-4` kg/s: tighter relative tolerances made Newton stall at the
   plume front (linear convergence from upwind switching); the mass balances above show the chosen values
   keep the error below 0.1 %. (The earlier nodal model used 2e-3.)
+
+* **H2 fraction as the primary variable (after the second full-grid run).** With xng bounded to
+  [-0.05, 1.05] the full grid stalled at day 20 with cells held at xng = 1.05, i.e. 5 % *negative* H2,
+  which the upwind fluxes passed on to neighbours. A bound exactly at "no H2" is needed, but the bounded
+  solver needs each equation to increase with its variable and drops that equation when the bound is
+  active. H2 mass falls as xng rises, so the primary composition variable is now **zh2 = 1 - xng** (H2
+  mass fraction of the gas): H2 equation on zh2, native-gas equation on sgas, bounds 0 <= zh2 <= 1.05.
+  At zh2 = 0 (no H2) the solver drops the H2 equation, which is the empty one there, and the native-gas
+  equation on sgas stays regular. The mixture table is written as `h2_mix_pvt_zh2.csv` (composition
+  column = zh2). `xng` is still written out (aux variable, CSV columns `min_xng`, `max_xng`, `xng_well`).
+  19-layer check, 40 days of injection: same pressures and plume as before, 3-4 Newton iterations per
+  step, no failed steps, H2 balance -47 kg of 219 t injected.
+  Also fixed: the H2 density fit used for the injection limit read the table row xng = -0.05 (beyond pure
+  H2) instead of xng = 0; H2 density at 18 MPa is now 11.4 kg/m3 (was 10.9).
+  **Update (third full-grid run):** with the upper bound at 1.05 the full grid stalled at day 158.7 with
+  near-well cells held at zh2 = 1.05 (5 % negative native gas). The equations are now: water on pwater,
+  **total gas** (native gas + H2) on sgas, H2 on zh2, with exact bounds 0 <= zh2 <= 1. On either bound
+  the solver drops the H2 equation and the total-gas equation is the conservation law of the one gas
+  present, so the matrix stays regular and both component masses are conserved. 19-layer check, 120
+  days of injection (pure-H2 cells on the bound from day 74): 7-day steps, 2-6 Newton iterations, one
+  failed step, H2 balance -86 kg of 657 t injected.
+  `dtmin = 1 s`: if Newton ever stalls again the run stops (checkpoint kept) instead of shrinking the
+
+
+## Storage run with rel-perm hysteresis (same start as a run without it)
+
+Hysteresis needs the add-on `ADPorousFlowRelativePermeabilityHysteresisTable` in the app (see
+`moose_addon/README.md`). Take the rel-perm from a history input written with
+`em2ex2moose.py --fv --relperm deck` (the default) and the end-of-history state from the existing
+(no-hysteresis) history results:
+
+    python gen_h2_fv.py --hist-input <hyst history folder>/croft_full_fv.i \
+           --hist-exodus <old history folder>/croft_full_fv_exodus.e -o croft_h2_full_hyst
+
+The two history inputs must come from the same em2ex mesh and options (only `--relperm` differs), so
+the cells are the same. The history output has no `sg_max`; the generator uses max(initial, end) gas
+saturation, which in a depleted reservoir is the initial one almost everywhere. Both storage runs then
+start from the identical state and differ only in the rel-perm (Eclipse tables + hysteresis instead of
+Corey fits). Compare them with
+
+    python compare_h2_runs.py --run "no hysteresis=croft_h2_full" --run "hysteresis=croft_h2_full_hyst" -o compare_hyst
+
+
+## Fault connections (non-neighbour connections, NNC)
+
+History inputs written by the current `em2ex2moose.py --fv` connect the cells on the two sides of faults
+with throw using Eclipse's own transmissibilities (`<prefix>_nnc.csv`, kernel `FVPorousFlowNNCFlux`; see
+em2ex_to_moose's README and `moose_addon/README`). Earlier inputs left those faults sealed; on Croft a
+sealed fault next to CROFT_1 made the well block pressure up to 160 psi too low in the history.
+
+`gen_h2_fv.py` finds the NNC kernels in the history input, copies the CSV to `<o>_nnc.csv` and adds four
+kernels (water; native gas and H2 in the total-gas equation; H2 in the H2 equation) with mobility from the
+start of the step and pressure and composition implicit, plus `allow_renumbering = false`. Nothing to set.
+
+Add the two files to MOOSE (once) next to the other add-ons:
+
+    mkdir -p include/relationshipmanagers src/relationshipmanagers
+    cp <thermal_h2>/croft_h2_fv/moose_addon/FVPorousFlowNNCFlux.h include/fvkernels/
+    cp <thermal_h2>/croft_h2_fv/moose_addon/FVPorousFlowNNCFlux.C src/fvkernels/
+    cp <thermal_h2>/croft_h2_fv/moose_addon/NNCRelationshipManager.h include/relationshipmanagers/
+    cp <thermal_h2>/croft_h2_fv/moose_addon/NNCRelationshipManager.C src/relationshipmanagers/
+    make -j 8
+    ./porous_flow-opt --registry | grep NNC        # 2 lines
+
+For a storage run that starts from the right state, regenerate and rerun the history with the NNCs first
+(the end-of-history pressures and saturations near the well change), then generate the storage input from
+that run. Storage runs started from the old (sealed) history are still comparable with each other.

@@ -337,3 +337,13 @@ lib/
 *.e
 *.csv
 *_out_cp/
+# data and run folders, not code
+CROFT_files/
+em2ex_to_moose/CROFT_files/
+em2ex_to_moose/croft_h2_fv/
+hist_nnc/
+h2_nnc/
+*_old/
+*.e
+*_out_cp/
+*.out

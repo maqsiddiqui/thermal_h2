@@ -16,7 +16,7 @@ Writes
   <out>.i   the storage input
   <out>_report.md
 Physics: 3 components (0 water, 1 native gas, 2 hydrogen) in 2 phases (water, gas), primary variables
-pwater, sgas, xng (native-gas mass fraction of the gas phase). Mixing of H2 into the native gas by
+pwater, sgas, zh2 (H2 mass fraction of the gas phase). Mixing of H2 into the native gas by
 advection and the numerical dispersion of the upwind scheme. See README.md.
 """
 import argparse, os, re, shutil, sys
@@ -72,6 +72,60 @@ def elem_field(ds, name, step):
     return np.concatenate(out)
 
 
+def copy_with_elem_vars(src, dst, new):
+    """Copy an Exodus (netCDF-3) file, adding element variables `new` (names), initialised to 0.
+    All variables are defined first and filled afterwards (netCDF-3 rewrites the file on every re-definition)."""
+    a = netCDF4.Dataset(src)
+    a.set_auto_mask(False)
+    b = netCDF4.Dataset(dst, "w", format=a.file_format)
+    b.set_auto_mask(False)
+    b.setncatts({k: a.getncattr(k) for k in a.ncattrs()})
+    nev = a.dimensions["num_elem_var"].size if "num_elem_var" in a.dimensions else 0
+    for k, d in a.dimensions.items():
+        b.createDimension(k, None if d.isunlimited() else (nev + len(new) if k == "num_elem_var" else d.size))
+    if "num_elem_var" not in a.dimensions:
+        b.createDimension("num_elem_var", len(new))
+    nblk = a.dimensions["num_el_blk"].size
+    copy = [k for k in a.variables if k not in ("name_elem_var", "elem_var_tab")]
+    for k in copy:
+        v = a.variables[k]
+        o = b.createVariable(k, v.dtype, v.dimensions)
+        o.setncatts({x: v.getncattr(x) for x in v.ncattrs()})
+    b.createVariable("name_elem_var", "S1", ("num_elem_var", "len_name"))
+    b.createVariable("elem_var_tab", "i4", ("num_el_blk", "num_elem_var"))
+    for j in range(len(new)):
+        for e in range(nblk):
+            b.createVariable("vals_elem_var%deb%d" % (nev + j + 1, e + 1), "f8", ("time_step", "num_el_in_blk%d" % (e + 1)))
+    for k in copy:   # data
+        b[k][:] = a[k][:]
+    ln = a.dimensions["len_name"].size
+    rows = [] if nev == 0 else [np.asarray(r, "S1") for r in a["name_elem_var"][:]]
+    rows += [np.array([c.encode() for c in n_.ljust(ln, "\0")], dtype="S1") for n_ in new]
+    b["name_elem_var"][:] = np.array(rows)
+    t0 = a["elem_var_tab"][:] if "elem_var_tab" in a.variables else np.ones((nblk, nev), "i4")
+    b["elem_var_tab"][:] = np.hstack([t0, np.ones((nblk, len(new)), "i4")])
+    nt = max(a.dimensions["time_step"].size, 1)
+    for j in range(len(new)):
+        for e in range(nblk):
+            b["vals_elem_var%deb%d" % (nev + j + 1, e + 1)][:] = np.zeros((nt, a.dimensions["num_el_in_blk%d" % (e + 1)].size))
+    a.close()
+    b.close()
+
+
+def write_zh2_table(src, dst):
+    """The mixture table with its composition column (native-gas fraction xng, in the 'temperature' slot) turned
+    into the H2 fraction zh2 = 1 - xng, rows sorted as TabulatedFluidProperties needs (pressure, then zh2)."""
+    with open(src) as f:
+        head = f.readline()
+    t = np.loadtxt(src, delimiter=",", skiprows=1)
+    t[:, 1] = 1.0 - t[:, 1]
+    t = t[np.lexsort((t[:, 1], t[:, 0]))]
+    with open(dst, "w", newline="\n") as f:
+        f.write(head)
+        for r in t:
+            f.write(",".join("%.10g" % v for v in r) + "\n")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--hist-input", required=True, help="history-match FV input (.i) written by em2ex2moose.py --fv")
@@ -86,6 +140,9 @@ def main():
     ap.add_argument("--dtmax-days", type=float, default=7.0)
     ap.add_argument("--eps", type=float, default=1e-5, help="dissolved-gas mass fraction in water (numerical)")
     ap.add_argument("--native-molar-mass", type=float, default=18.92, help="native gas molar mass [g/mol]")
+    ap.add_argument("--exodus-days", type=float, default=30.0,
+                    help="also write the 3D fields every this many days (default 30; 0: only at the switch "
+                         "times). Each output of the full grid is about 50 MB")
     ap.add_argument("--deck", help="Eclipse .DATA deck: well connection factors (COMPDAT CF), BHP reference depth "
                     "(WELSPECS), initial pressure (EQUIL + PVDG). Without it the Croft values are used.")
     ap.add_argument("--p-max-psia", type=float, help="injection limit on the bottom-hole pressure at the BHP reference "
@@ -132,6 +189,11 @@ def main():
         b = [bb for nn, bb in subblocks(pps, r"%s_gas_pressure" % re.escape(w))]
         pts[w] = param(b[0], "point")
     hist_end = float(param(section(txt, "Executioner"), "end_time"))
+    nnc_src = None
+    for n_, b_ in subblocks(section(txt, "FVKernels"), r"nnc_\w+"):
+        if "FVPorousFlowNNCFlux" in b_:
+            nnc_src = os.path.join(hdir, param(b_, "nnc_file"))
+            break
 
     # ------------------------------------------------------------------ end-of-history state
     he = netCDF4.Dataset(a.hist_exodus)
@@ -155,10 +217,28 @@ def main():
     pw_h = elem_field(he, "pwater", step)
     sg_h = elem_field(he, "sgas", step)
     ch, _ = centroids(he)
+    # rel-perm hysteresis (history input made with --relperm deck): carry each cell's largest gas saturation
+    hyst = any("max_saturation" in b for n, b in keep if n.startswith("relperm_"))
+    sgmax_h = None
+    if hyst:
+        if "sg_max" in names(he, "name_elem_var"):
+            sgmax_h = elem_field(he, "sg_max", step)
+            rep.append("Rel-perm hysteresis: each cell's largest gas saturation so far (sg_max) is taken from the "
+                       "history output and keeps evolving in the storage run.\n")
+        else:
+            sgmax_h = np.maximum(elem_field(he, "sgas", 0), sg_h)
+            rep.append("Rel-perm hysteresis: the history output has no sg_max (history run without hysteresis), so "
+                       "each cell's largest gas saturation is taken as max(initial, end-of-history) Sg. Gas "
+                       "saturation fell almost everywhere during depletion, so this is close to the true maximum; "
+                       "cells already invaded by water start on their Killough scanning curves.\n")
+            print("NOTE: no sg_max in the history output; sg_max = max(initial, end-of-history) gas saturation")
 
     # ------------------------------------------------------------------ new mesh with that state
     out_e = a.out + ".e"
-    shutil.copyfile(mesh, out_e)
+    if hyst:
+        copy_with_elem_vars(mesh, out_e, ["sg_max"])
+    else:
+        shutil.copyfile(mesh, out_e)
     me = netCDF4.Dataset(out_e, "a")
     me.set_auto_mask(False)
     cm, nper = centroids(me)
@@ -168,7 +248,10 @@ def main():
     ev = names(me, "name_elem_var")
     off = 0
     for b, n in enumerate(nper):
-        for name, val in (("p_init", pw_h), ("sg_init", np.clip(sg_h, 0.0, 0.999))):
+        fields = [("p_init", pw_h), ("sg_init", np.clip(sg_h, 0.0, 0.999))]
+        if hyst:
+            fields.append(("sg_max", np.clip(sgmax_h, 0.0, 1.0)))
+        for name, val in fields:
             v = "vals_elem_var%deb%d" % (ev.index(name) + 1, b + 1)
             me[v][0, :] = val[idx[off:off + n]]
         off += n
@@ -194,6 +277,10 @@ def main():
     for k in range(a.cycles):
         sw += [k * P + Ti, (k + 1) * P]
     sw_s = " ".join("%.1f" % s for s in sw)
+    ex_t = set(round(s, 1) for s in sw)
+    if a.exodus_days > 0:
+        ex_t |= set(round(t, 1) for t in np.arange(a.exodus_days * DAY, a.cycles * P, a.exodus_days * DAY))
+    ex_s = " ".join("%.1f" % t for t in sorted(ex_t))
     sched_y = " ".join(str(i) for i in range(len(sw) + 1))
     well = wells[0]
     if len(wells) > 1:
@@ -237,7 +324,7 @@ def main():
         p_min = float(hist_p[hist_p > 0].min())
     # H2 density at reservoir conditions from the mixture table (xng = 0): rho = p / (A + B p)
     mt = np.loadtxt(a.mix_table, delimiter=",", skiprows=1)
-    h2 = mt[mt[:, 1] == mt[:, 1].min()]
+    h2 = mt[np.isclose(mt[:, 1], 0.0)]
     sel = (h2[:, 0] > 5e6) & (h2[:, 0] < 35e6)
     Bh, Ah = np.polyfit(h2[sel, 0], h2[sel, 0] / h2[sel, 2], 1)
     rep.append("Well %s: sum of open COMPDAT CF = %.6g cP.rb/d/psi = %.6g m3 (%s); BHP reference depth %.2f m.\n"
@@ -277,19 +364,19 @@ def main():
   [aq{k}_ng]      # ... dissolved native gas (aquifer water carries native gas; outflow carries the cell's mix)
     type = ADParsedFunctorMaterial
     property_name = aq{k}_ng
-    functor_names = 'aq{k}_influx xng'
-    functor_symbols = 'f c'
-    expression = '{EPS:g} * f * if(f > 0, 1, min(max(c, 0), 1))'
+    functor_names = 'aq{k}_influx zh2'
+    functor_symbols = 'f h'
+    expression = '{EPS:g} * f * if(f > 0, 1, 1 - min(max(h, 0), 1))'
   []
   [aq{k}_h2]      # ... dissolved H2 (only leaves the reservoir)
     type = ADParsedFunctorMaterial
     property_name = aq{k}_h2
-    functor_names = 'aq{k}_influx xng'
-    functor_symbols = 'f c'
-    expression = '{EPS:g} * f * if(f > 0, 0, 1 - min(max(c, 0), 1))'
+    functor_names = 'aq{k}_influx zh2'
+    functor_symbols = 'f h'
+    expression = '{EPS:g} * f * if(f > 0, 0, min(max(h, 0), 1))'
   []""")
-        for comp, var in (("water", "pwater"), ("ng", "xng"), ("h2", "sgas")):
-            aq_bcs.append(f"""  [aquifer_{k}_{comp}]
+        for comp, var in (("water", "pwater"), ("ng", "sgas"), ("h2", "sgas"), ("h2", "zh2")):
+            aq_bcs.append(f"""  [aquifer_{k}_{comp}_{var}]
     type = FVFunctorNeumannBC
     variable = {var}
     boundary = '{aq['bnd']}'
@@ -356,6 +443,62 @@ def main():
     ssum = lambda p: " + ".join("%s%d" % (p, i) for i in range(na))
     ooc = (" -mat_mumps_icntl_22", " 1") if a.mumps_ooc else ("", "")
 
+    nnc_mesh = nnc_fmat = nnc_k = ""
+    if nnc_src:
+        nnc_out = a.out + "_nnc.csv"
+        if os.path.abspath(nnc_src) != os.path.abspath(nnc_out):
+            shutil.copyfile(nnc_src, nnc_out)
+        nnc_name = os.path.basename(nnc_out)
+        rep.append("Non-neighbour (fault) connections of the history input carried over: %s "
+                   "(FVPorousFlowNNCFlux; mobility lagged, pressure and composition implicit).\n" % nnc_name)
+        nnc_mesh = "  allow_renumbering = false # the non-neighbour connections refer to the element ids of the file\n"
+        nnc_fmat = f"""  # ---- composition on the non-neighbour (fault) connections: (water, native gas, H2) per phase ---
+  [nnc_x_w1]
+    type = ADParsedFunctorMaterial
+    property_name = nnc_x_w1
+    functor_names = 'zh2'
+    functor_symbols = 'h'
+    expression = '{EPS:g} * (1 - h)'
+  []
+  [nnc_x_w2]
+    type = ADParsedFunctorMaterial
+    property_name = nnc_x_w2
+    functor_names = 'zh2'
+    functor_symbols = 'h'
+    expression = '{EPS:g} * h'
+  []
+  [nnc_x_g1]
+    type = ADParsedFunctorMaterial
+    property_name = nnc_x_g1
+    functor_names = 'zh2'
+    functor_symbols = 'h'
+    expression = '1 - h'
+  []
+"""
+        common = (f"    nnc_file = {nnc_name}\n    pressure = pwater\n    pressure_offsets = '0 pc_lag'\n"
+                  "    relperm = 'krw krg'\n    density = 'water_density rho_g_lag'\n    viscosity = 'muw mug'\n")
+        for nm, var, xf, cm in (("nnc_water", "pwater", "'%g 0'" % (1 - EPS), "water"),
+                                ("nnc_ng", "sgas", "'nnc_x_w1 nnc_x_g1'", "native gas, total-gas equation"),
+                                ("nnc_h2_tot", "sgas", "'nnc_x_w2 zh2'", "H2, total-gas equation"),
+                                ("nnc_h2", "zh2", "'nnc_x_w2 zh2'", "H2 equation")):
+            nnc_k += (f"  [{nm}]   # {cm}: flow through the non-neighbour (fault) connections\n"
+                      f"    type = FVPorousFlowNNCFlux\n    variable = {var}\n{common}    mass_fraction = {xf}\n  []\n")
+    hyst_auxv = hyst_auxk = ""
+    if hyst:
+        hyst_auxv = """  [sg_max]   # largest gas saturation each cell has had (rel-perm hysteresis), from the history run
+    type = MooseVariableFVReal
+    initial_from_file_var = sg_max
+  []
+"""
+        hyst_auxk = """  [sg_max]   # updated once per time step (lagged); the gas rel-perm follows Killough scanning curves below it
+    type = ParsedAux
+    variable = sg_max
+    coupled_variables = 'sg_max sgas'
+    expression = 'max(sg_max, sgas)'
+    execute_on = timestep_end
+  []
+"""
+    mix_zh2 = os.path.splitext(os.path.basename(a.mix_table))[0] + "_zh2.csv"
     s = f"""# =============================================================================================
 # Cyclic hydrogen storage, finite-volume PorousFlow model (two-point flux, as the history match)
 #   {a.cycles} cycles of: inject {a.mass_t:g} t of pure H2 over {a.inj_days:g} d, then withdraw {a.mass_t:g} t of
@@ -365,11 +508,12 @@ def main():
 #   water PVT and aquifer are copied from that input.
 #
 #   3 components, 2 phases:
-#     component 0 = water (equation on pwater), 1 = native gas (on xng), 2 = hydrogen (on sgas)
+#     component 0 = water (equation on pwater), 2 = hydrogen (on zh2); total gas 1 + 2 on sgas
 #     phase 0 = water (+ {EPS:g} dissolved gas, see [massfrac]); phase 1 = gas (native gas + H2)
-#   primary variables (one value per cell): pwater [Pa], sgas [-], xng = native-gas mass fraction in the gas
-#   Mixture density and viscosity rho(p, xng), mu(p, xng) at the reservoir temperature are tabulated in
-#   {os.path.basename(a.mix_table)}; the table interpolates in (p, T), so xng is passed in the temperature slot
+#   primary variables (one value per cell): pwater [Pa], sgas [-], zh2 = H2 mass fraction of the gas
+#   (xng = 1 - zh2, the native-gas fraction, is kept as an output variable)
+#   Mixture density and viscosity rho(p, zh2), mu(p, zh2) at the reservoir temperature are tabulated in
+#   {mix_zh2}; the table interpolates in (p, T), so zh2 is passed in the temperature slot
 #   (the model is isothermal; nothing else uses temperature: water density has no thermal expansion).
 #   Mixing: advection of the mixture plus the numerical dispersion of the upwind two-point scheme
 #   (about half a cell, ~20 m laterally, ~0.5 m vertically on the full grid), larger than molecular
@@ -379,7 +523,7 @@ def main():
 #   may not fall below {p_min / PSI_:.1f} psia. Withdrawn gas comes from each completion cell and is split
 #   between native gas and H2 by that cell's composition (implicit), so purity and recovery are results.
 #   Requires an app with the add-ons FVPorousFlowAdvectiveFluxTPFA, ADPorousFlowPorosityRock,
-#   ADPorousFlowMassFractionLinear and FVMaxIncrementDamper.
+#   ADPorousFlowMassFractionLinear and FVMaxIncrementDamper (and FVPorousFlowNNCFlux with fault NNCs).
 # =============================================================================================
 
 [Mesh]
@@ -388,7 +532,7 @@ def main():
     file = {os.path.basename(out_e)}
     use_for_exodus_restart = true
   []
-[]
+{nnc_mesh}[]
 
 [GlobalParams]
   PorousFlowDictator = dictator
@@ -398,7 +542,7 @@ def main():
 [UserObjects]
   [dictator]
     type = PorousFlowDictator
-    porous_flow_vars = 'pwater sgas xng'
+    porous_flow_vars = 'pwater sgas zh2'
     number_fluid_phases = 2
     number_fluid_components = 3
   []
@@ -415,10 +559,10 @@ def main():
     type = MooseVariableFVReal
     initial_from_file_var = sg_init # end-of-history gas saturation
   []
-  [xng]
+  [zh2]   # H2 mass fraction of the gas
     type = MooseVariableFVReal
     two_term_boundary_expansion = false
-    initial_condition = 1 # only native gas at the start
+    initial_condition = 0 # only native gas at the start
   []
 []
 
@@ -444,6 +588,9 @@ def main():
 []
 
 [AuxVariables]
+{hyst_auxv}  [bounds_dummy]   # needed by the [Bounds] objects
+    type = MooseVariableFVReal
+  []
   [one]
     type = MooseVariableFVReal
     initial_condition = 1
@@ -481,6 +628,9 @@ def main():
     type = MooseVariableFVReal
   []
   [xh2]       # H2 mass fraction of the gas (0 where there is no gas)
+    type = MooseVariableFVReal
+  []
+  [xng]       # native-gas mass fraction of the gas, 1 - zh2 (output only)
     type = MooseVariableFVReal
   []
   [yh2]       # H2 mole fraction of the gas
@@ -539,8 +689,7 @@ def main():
 []
 
 [AuxKernels]
-{aq_auxk}
-  [pgas]
+{aq_auxk}{hyst_auxk}  [pgas]
     type = ADPorousFlowPropertyAux
     variable = pgas
     property = pressure
@@ -621,11 +770,18 @@ def main():
     property = porosity
     execute_on = 'initial timestep_end'
   []
+  [xng]
+    type = ParsedAux
+    variable = xng
+    coupled_variables = 'zh2'
+    expression = '1 - zh2'
+    execute_on = 'initial timestep_end'
+  []
   [xh2]
     type = ParsedAux
     variable = xh2
-    coupled_variables = 'xng sgas'
-    expression = 'if(sgas > 1e-6, 1 - xng, 0)'
+    coupled_variables = 'zh2 sgas'
+    expression = 'if(sgas > 1e-6, zh2, 0)'
     execute_on = 'initial timestep_end'
   []
   [yh2]
@@ -638,15 +794,15 @@ def main():
   [h2_md]
     type = ParsedAux
     variable = h2_md
-    coupled_variables = 'phi sgas xng gas_density water_density'
-    expression = 'phi * (sgas * gas_density * (1 - xng) + (1 - sgas) * water_density * {EPS:g} * (1 - xng))'
+    coupled_variables = 'phi sgas zh2 gas_density water_density'
+    expression = 'phi * (sgas * gas_density * zh2 + (1 - sgas) * water_density * {EPS:g} * zh2)'
     execute_on = 'initial timestep_end'
   []
   [ng_md]
     type = ParsedAux
     variable = ng_md
-    coupled_variables = 'phi sgas xng gas_density water_density'
-    expression = 'phi * (sgas * gas_density * xng + (1 - sgas) * water_density * {EPS:g} * xng)'
+    coupled_variables = 'phi sgas zh2 gas_density water_density'
+    expression = 'phi * (sgas * gas_density * (1 - zh2) + (1 - sgas) * water_density * {EPS:g} * (1 - zh2))'
     execute_on = 'initial timestep_end'
   []
   [w_md]
@@ -683,39 +839,64 @@ def main():
     fluid_component = 0
     variable = pwater
   []
-  [mass_ng_dot]
+  # Equations: water on pwater; TOTAL gas (native gas + H2) on sgas; H2 on zh2. Each conservation law
+  # is kept exactly (the native-gas one is total minus H2). The total-gas equation always depends on sgas,
+  # and the H2 equation increases with zh2, as the bounded solver needs: when zh2 sits on a bound (0: no
+  # H2, 1: no native gas) the solver drops the H2 equation and the total-gas equation, which is then the
+  # conservation law of the one gas present, keeps sgas determined.
+  [mass_ng_dot]   # native gas, in the total-gas equation (on sgas)
     type = FVPorousFlowMassTimeDerivative
     fluid_component = 1
-    variable = xng
+    variable = sgas
   []
   [flux_ng]
     type = FVPorousFlowAdvectiveFluxTPFA
     fluid_component = 1
-    variable = xng
+    variable = sgas
   []
-  [mass_h2_dot]
+  [mass_h2_dot_tot]   # H2, in the total-gas equation (on sgas)
     type = FVPorousFlowMassTimeDerivative
     fluid_component = 2
     variable = sgas
   []
-  [flux_h2]
+  [flux_h2_tot]
     type = FVPorousFlowAdvectiveFluxTPFA
     fluid_component = 2
     variable = sgas
   []
-  [h2_injection]
+  [mass_h2_dot]   # H2 equation (on zh2)
+    type = FVPorousFlowMassTimeDerivative
+    fluid_component = 2
+    variable = zh2
+  []
+  [flux_h2]
+    type = FVPorousFlowAdvectiveFluxTPFA
+    fluid_component = 2
+    variable = zh2
+  []
+{nnc_k}  [h2_injection]
+    type = FVCoupledForce
+    variable = zh2
+    v = src_h2_inj
+  []
+  [h2_injection_tot]
     type = FVCoupledForce
     variable = sgas
     v = src_h2_inj
   []
   [h2_withdrawal]
     type = FVCoupledForce
+    variable = zh2
+    v = src_h2_wd
+  []
+  [h2_withdrawal_tot]
+    type = FVCoupledForce
     variable = sgas
     v = src_h2_wd
   []
   [ng_withdrawal]
     type = FVCoupledForce
-    variable = xng
+    variable = sgas
     v = src_ng_wd
   []
 []
@@ -726,9 +907,9 @@ def main():
 
 [FluidProperties]
 {water}
-  [gas]   # native gas + H2 mixture; 'temperature' column = native-gas mass fraction xng
+  [gas]   # native gas + H2 mixture; 'temperature' column = H2 mass fraction zh2
     type = TabulatedBicubicFluidProperties
-    fluid_property_file = {os.path.basename(a.mix_table)}
+    fluid_property_file = {mix_zh2}
     interpolated_properties = 'density viscosity'
     out_of_bounds_behavior = set_to_closest_bound
   []
@@ -737,17 +918,17 @@ def main():
 [Materials]
   [temperature]   # composition carried in the temperature slot (see header)
     type = ADPorousFlowTemperature
-    temperature = xng
+    temperature = zh2
   []
   [massfrac]
-    # gas phase:   (water, native gas, H2) = (0, xng, 1 - xng)
-    # water phase: (water, native gas, H2) = (1 - EPS, EPS xng, EPS (1 - xng)), EPS = {EPS:g}
-    # The small dissolved fraction gives xng a conservation equation where there is no free gas, so
+    # gas phase:   (water, native gas, H2) = (0, 1 - zh2, zh2)
+    # water phase: (water, native gas, H2) = (1 - EPS, EPS (1 - zh2), EPS zh2), EPS = {EPS:g}
+    # The small dissolved fraction gives zh2 a conservation equation where there is no free gas, so
     # Newton stays well posed at the gas front. (Real solubilities: CH4 ~1.5e-3, H2 ~2e-6 by mass.)
     type = ADPorousFlowMassFractionLinear
-    mass_fraction_vars = 'one xng zero xng'
-    multipliers = '1 {EPS:g} 1 1'
-    offsets = '{-EPS:g} 0 0 0'
+    mass_fraction_vars = 'one zh2 zero zh2'
+    multipliers = '1 {-EPS:g} 1 -1'
+    offsets = '{-EPS:g} {EPS:g} 0 1'
   []
   [water]
     type = ADPorousFlowSingleComponentFluid
@@ -767,7 +948,7 @@ def main():
 []
 
 [FunctorMaterials]
-  # ---- well: rate target, limited by the bottom-hole pressure ---------------------------------------
+{nnc_fmat}  # ---- well: rate target, limited by the bottom-hole pressure ---------------------------------------
   # Each completion cell c takes its share w_c V_c of the target rate (w = ww_{well} = share / cell volume,
   # shares from COMPDAT KH, proportional to the connection factors CF), unless that would need a well
   # pressure beyond the limit; then the cell gets the rate the limiting pressure gives:
@@ -820,23 +1001,23 @@ def main():
   [src_h2_wd]    # kg/s/m3 of H2 withdrawn (negative): the cell's withdrawal x its H2 fraction
     type = ADParsedFunctorMaterial
     property_name = src_h2_wd
-    functor_names = 'wd_cell xng'
-    functor_symbols = 'qc c'
-    expression = '-qc * (1 - min(max(c, 0), 1))'
+    functor_names = 'wd_cell zh2'
+    functor_symbols = 'qc h'
+    expression = '-qc * min(max(h, 0), 1)'
   []
   [src_ng_wd]    # kg/s/m3 of native gas withdrawn (negative)
     type = ADParsedFunctorMaterial
     property_name = src_ng_wd
-    functor_names = 'wd_cell xng'
-    functor_symbols = 'qc c'
-    expression = '-qc * min(max(c, 0), 1)'
+    functor_names = 'wd_cell zh2'
+    functor_symbols = 'qc h'
+    expression = '-qc * (1 - min(max(h, 0), 1))'
   []
   [deliv_sm3pd]  # deliverability density: wd_cap in standard m3 per day (mix of the cell's gas)
     type = ADParsedFunctorMaterial
     property_name = deliv_sm3pd
-    functor_names = 'wd_cap xng'
-    functor_symbols = 'cap c'
-    expression = 'cap * 86400 * (min(max(c, 0), 1) / {rho_sc_ng:.6g} + (1 - min(max(c, 0), 1)) / {a.rho_sc_h2:.6g})'
+    functor_names = 'wd_cap zh2'
+    functor_symbols = 'cap h'
+    expression = 'cap * 86400 * ((1 - min(max(h, 0), 1)) / {rho_sc_ng:.6g} + min(max(h, 0), 1) / {a.rho_sc_h2:.6g})'
   []
   [bhp_inj]      # BHP at the reference depth implied by each completion cell while injecting (-1e30 elsewhere)
     type = ADParsedFunctorMaterial
@@ -1078,6 +1259,27 @@ def main():
   []
 []
 
+[Bounds]   # 0 <= zh2 <= 1 in every cell (no negative H2, no negative native gas), enforced by PETSc's
+           # variational-inequality Newton solver (vinewtonrsls). Cells with almost no gas determine zh2 only
+           # through the tiny dissolved fraction; without the bounds Newton can push it outside [0, 1] and the
+           # upwind fluxes then spread negative component masses. On a bound the H2 equation is dropped and
+           # the total-gas equation (on sgas) carries the conservation of the gas that is present.
+  [zh2_lo]
+    type = ConstantBounds
+    variable = bounds_dummy
+    bounded_variable = zh2
+    bound_type = lower
+    bound_value = 0
+  []
+  [zh2_hi]
+    type = ConstantBounds
+    variable = bounds_dummy
+    bounded_variable = zh2
+    bound_type = upper
+    bound_value = 1
+  []
+[]
+
 [Dampers]   # Newton damping (add-on FVMaxIncrementDamper; MOOSE's MaxIncrement is for finite-element variables)
   [limit_p]
     type = FVMaxIncrementDamper
@@ -1089,12 +1291,10 @@ def main():
     variable = sgas
     max_increment = 0.2
   []
-  [limit_x]   # composition: at most 0.2 per iteration, and kept inside [0, 1], where there is gas
+  [limit_x]   # composition: at most 0.2 per iteration where there is gas ([0, 1] is enforced in every cell by [Bounds])
     type = FVMaxIncrementDamper
-    variable = xng
+    variable = zh2
     max_increment = 0.2
-    min_value = 0
-    max_value = 1
     ignore_variable = sgas # composition is poorly determined in cells with almost no gas: not damped there
     ignore_below = 1e-3
   []
@@ -1104,8 +1304,8 @@ def main():
   [mumps]   # direct solver; ~3 unknowns per cell
     type = SMP
     full = true
-    petsc_options_iname = '-pc_type -pc_factor_mat_solver_type -mat_mumps_icntl_14{ooc[0]}'
-    petsc_options_value = ' lu       mumps                      {a.mumps_relax}{ooc[1]}'
+    petsc_options_iname = '-snes_type    -pc_type -pc_factor_mat_solver_type -mat_mumps_icntl_14{ooc[0]}'
+    petsc_options_value = ' vinewtonrsls  lu       mumps                      {a.mumps_relax}{ooc[1]}'
   []
 []
 
@@ -1116,6 +1316,7 @@ def main():
   automatic_scaling = false
   end_time = {t_end:.1f} # s ({a.cycles} cycles x {(a.inj_days + a.wd_days):g} d = {t_end / DAY:g} d)
   dtmax = {a.dtmax_days * DAY:.0f} # {a.dtmax_days:g} days
+  dtmin = 1 # s: stop (checkpoint kept) instead of cutting the step forever if Newton cannot converge
   nl_rel_tol = {a.nl_rel_tol:g}
   nl_abs_tol = {a.nl_abs_tol:g} # kg/s summed over the cells
   nl_max_its = 12
@@ -1138,18 +1339,17 @@ def main():
   [csv]
     type = CSV
   []
-  [exodus]   # 3D fields at the start and at the end of every injection and withdrawal period
+  [exodus]   # 3D fields at the start, at the end of every injection and withdrawal period{"" if a.exodus_days <= 0 else " and every %g days" % a.exodus_days}
     type = Exodus
-    sync_times = '{sw_s}'
+    sync_times = '{ex_s}'
     sync_only = true
     execute_on = 'initial timestep_end'
-    hide = 'one zero poro perm_xx perm_yy perm_zz perm_xy ww_{well} h2_md ng_md w_md hcpv p_hcpv krg krw mug muw pc_lag rho_g_lag bhp_inj_cell bhp_wd_cell {" ".join("p_aq%s" % aq["k"] for aq in aqs)}'
+    hide = 'one zero bounds_dummy poro perm_xx perm_yy perm_zz perm_xy ww_{well} h2_md ng_md w_md hcpv p_hcpv krg krw mug muw pc_lag rho_g_lag bhp_inj_cell bhp_wd_cell {" ".join("p_aq%s" % aq["k"] for aq in aqs)}'
   []
 []
 """
     open(a.out + ".i", "w", newline="\n").write(s)
-    if not os.path.exists(os.path.basename(a.mix_table)):
-        shutil.copyfile(a.mix_table, os.path.basename(a.mix_table))
+    write_zh2_table(a.mix_table, os.path.join(os.path.dirname(os.path.abspath(a.out)), mix_zh2))
     rep.append("Schedule: %d cycles, injection %.6g kg/s for %g d, withdrawal %.6g kg/s for %g d; end %.0f s.\n"
                % (a.cycles, q_inj, a.inj_days, q_wd, a.wd_days, t_end))
     rep.append("Copied from the history input: %d capillary-pressure objects, %d ppss materials, %d other rock materials; "
