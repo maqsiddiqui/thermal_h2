@@ -182,6 +182,12 @@ full 92-layer Croft grid does not converge. With `--fv` the model stores one val
   (Croft: `SATOPTS HYSTER`, `EHYSTR 1* 3 2* KR`): gas on Killough scanning curves towards the IMBNUM tables
   (trapped gas 0.05-0.27), water on the imbibition tables scaled to IKRW = 0.55 in every cell. Needs the add-on
   `ADPorousFlowRelativePermeabilityHysteresisTable`. `--relperm corey` gives the earlier Corey fits.
+  Water end-point scaling (Eclipse `ENDSCALE`): each water table is stretched two-point so that krw = 0 up to
+  the cell's critical water saturation and reaches its end at SWU, using SWCR/SWU (drainage) and ISWCR/ISWU
+  (imbibition) from the INIT file. Croft has no SWCR keyword but Eclipse derives ISWCR above the table value
+  (SATNUM 5: 0.24 vs 0.15, SATNUM 6: 0.13 vs 0.10). Without it (converter before 27 Nov) water was mobile at
+  Sw 0.15-0.24 in the main gas rock and the well produced ~24x Eclipse's water (92 layers: 9,320 vs 387 stb).
+  Checked against the restart: scaled tables reproduce Eclipse's WATKR exactly.
   Croft 19 layers (`validation/croft_fv19_hysteresis_vs_eclipse.png`): field pressure within 3-7 psi of
   Eclipse to day 240 (Corey fits: 16-64 psi high), water influx within ~4 % (Corey: 10-40 % high).
   KNOWN LIMIT: the history wells are fixed-rate sinks. On 19 layers the single coarse completion cell is

@@ -168,7 +168,7 @@ def _attach_init_restart(md, init, unrst, restart_step, log):
             if kw in ("PORO", "PERMX", "PERMY", "PERMZ", "NTG", "PORV", "SATNUM", "PVTNUM", "FIPNUM",
                       "EQLNUM", "MULTX", "MULTY", "MULTZ", "SWL", "SGCR", "SWCR", "SWU", "SGU", "DEPTH",
                       "DZ", "TOPS", "TRANX", "TRANY", "TRANZ", "ROCKNUM", "MULTPV", "MULTNUM", "FLUXNUM",
-                      "OPERNUM", "SWATINIT", "IMBNUM", "PCW", "SWLPC", "KRW", "KRG", "IKRW", "IKRG") and kw not in md.props:
+                      "OPERNUM", "SWATINIT", "IMBNUM", "PCW", "SWLPC", "KRW", "KRG", "IKRW", "IKRG", "ISWCR", "ISWU") and kw not in md.props:
                 g = to_global(a)
                 if g is not None:
                     md.props[kw] = g * (eclio.UNITS[md.units]["pressure"] if kw == "PCW" else 1.0)
@@ -283,7 +283,7 @@ def upscale_layers(md, nmerge, log=print):
                                                 (H[s_] * A[s_]).sum(0) / np.maximum(
                                                     (H[s_] * A[s_] / np.maximum(kz[s_], 1e-12)).sum(0), 1e-30), 0.0))
     pvsum = agg(lambda s_: PV[s_].sum(0))
-    for nm in ("SWL", "SWATINIT", "PCW", "SWLPC", "KRW", "KRG", "IKRW", "IKRG"):
+    for nm in ("SWL", "SWATINIT", "PCW", "SWLPC", "KRW", "KRG", "IKRW", "IKRG", "SWCR", "SWU", "ISWCR", "ISWU"):
         if nm in P_:
             x = R(np.nan_to_num(P_[nm]))
             newp[nm] = agg(lambda s_: (x[s_] * PV[s_]).sum(0)) / np.maximum(pvsum, 1e-30)
@@ -381,6 +381,23 @@ def brooks_corey_pc(sw, pe, lam, sat_lr, pc_max):
     return np.where(se >= 1.0, pe, np.minimum(pe * se ** (-1.0 / lam), pc_max))
 
 
+
+def _scale_water_axis(s, k, crit_cell, swu_cell):
+    """Eclipse two-point end-point scaling of a water rel-perm table (ENDSCALE): the table's critical
+    saturation (last Sw with krw = 0) maps to the cell's SWCR and the table's last Sw to the cell's SWU,
+    linearly in between; krw stays 0 up to SWCR. Returns the new saturation axis and krw values."""
+    s = np.asarray(s, float); k = np.asarray(k, float)
+    pos = np.nonzero(k > 0)[0]
+    if crit_cell is None or swu_cell is None or len(pos) == 0 or pos[0] == 0:
+        return s, k
+    i0 = pos[0] - 1
+    crit_t, swu_t = s[i0], s[-1]
+    if not (swu_cell > crit_cell) or not (swu_t > crit_t):
+        return s, k
+    ns = crit_cell + (s[i0:] - crit_t) * (swu_cell - crit_cell) / (swu_t - crit_t)
+    head = s[:i0][s[:i0] < ns[0] - 1e-9]
+    return np.concatenate([head, ns]), np.concatenate([np.zeros(len(head)), k[i0:]])
+
 def _relperm_tables(relperm, m, deck, P, gi, satnum, args, rep):
     """--relperm table/deck (finite-volume input only): keep the deck's tables instead of Corey fits, and with
     SATOPTS HYSTER (--relperm deck) add each block's imbibition table (IMBNUM) and Eclipse's hysteresis option,
@@ -426,6 +443,10 @@ def _relperm_tables(relperm, m, deck, P, gi, satnum, args, rep):
         def med(nm):
             return float(np.median(np.asarray(P[nm], float)[gi][sel])) if nm in P and sel.any() else None
         kw_cell, kg_cell = med("KRW"), med("KRG")
+        # Eclipse end-point scaling of the water curve (SWCR, SWU from the INIT; ENDSCALE)
+        s0, k0 = tab["sw"].copy(), tab["krw"].copy()
+        tab["sw"], tab["krw"] = _scale_water_axis(tab["sw"], tab["krw"], med("SWCR"), med("SWU"))
+        tab["w_scaled"] = (not np.array_equal(s0, tab["sw"]), med("SWCR"), med("SWU"))
         tab["mult_w"] = kw_cell / tab["krw"][-1] if kw_cell and tab["krw"][-1] > 0 else 1.0
         if kg_cell and tab["krg"][-1] > 0 and abs(kg_cell / tab["krg"][-1] - 1) > 0.01:
             rep("- NOTE: %s: KRG %.4g differs from the table end point %.4g (not scaled)."
@@ -440,6 +461,9 @@ def _relperm_tables(relperm, m, deck, P, gi, satnum, args, rep):
                            kr_model=hy["kr_model"])
                 ik = med("IKRW")
                 tab["mult_wi"] = ik / tab["ikrw"][-1] if ik and tab["ikrw"][-1] > 0 else 1.0
+                s0 = tab["isw"].copy()
+                tab["isw"], tab["ikrw"] = _scale_water_axis(tab["isw"], tab["ikrw"], med("ISWCR"), med("ISWU"))
+                tab["wi_scaled"] = (not np.array_equal(s0, tab["isw"]), med("ISWCR"), med("ISWU"))
                 if len(vals) > 1:
                     rep("- NOTE: %s has cells of IMBNUM %s; table %d (the most common) is used."
                         % (rp["block"], " ".join(map(str, vals.tolist())), it))
@@ -458,6 +482,10 @@ def _relperm_tables(relperm, m, deck, P, gi, satnum, args, rep):
             if t["kr_model"] == 3:
                 line += "; water krw at the end of the imbibition table %.4g scaled by IKRW to %.4g (x%.3g)" % (
                     t["ikrw"][-1], t["ikrw"][-1] * t["mult_wi"], t["mult_wi"])
+        for key, nm in (("w_scaled", "drainage"), ("wi_scaled", "imbibition")):
+            if t.get(key) and t[key][0]:
+                line += "; %s water curve end-point scaled to SWCR %.4f, SWU %.4f (Eclipse ENDSCALE: krw = 0 below SWCR)" % (
+                    nm, t[key][1], t[key][2])
         rep(line + ".")
 
 

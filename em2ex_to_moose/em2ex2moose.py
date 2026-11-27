@@ -121,7 +121,7 @@ def upscale_groups(md, groups, log=print):
     A, PV = act, R(porv)
     pvsum = agg(lambda s_: PV[s_].sum(0))
     newp = {"PORV": pvsum}
-    for nm in ("SWL", "SWATINIT", "PCW", "SWLPC", "KRW", "KRG", "IKRW", "IKRG"):
+    for nm in ("SWL", "SWATINIT", "PCW", "SWLPC", "KRW", "KRG", "IKRW", "IKRG", "SWCR", "SWU", "ISWCR", "ISWU"):
         if nm in P_:
             x = R(np.nan_to_num(P_[nm]))
             newp[nm] = agg(lambda s_: (x[s_] * PV[s_]).sum(0)) / np.maximum(pvsum, 1e-30)
